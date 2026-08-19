@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from app.auth import render_auth_gate, render_user_menu
 from app.diagrams import dam_cross_section_figure, glof_trigger_figure
 from models.breach_equations import run_breach_method
 from models.hydrograph import estimate_peak_from_volume, triangular_hydrograph
@@ -20,6 +21,8 @@ from models.scenarios import SCENARIOS
 
 st.set_page_config(page_title="Dam Breach Studio", layout="wide")
 
+supabase = render_auth_gate()
+
 st.title("Dam Breach Studio")
 st.caption("A transparent prototype for breach-parameter, GLOF, and hydrograph analysis.")
 
@@ -28,6 +31,9 @@ with st.sidebar:
     project_name = st.text_input("Project name", "Example breach study")
     scenario_name = st.selectbox("Scenario type", list(SCENARIOS.keys()))
     failure_mode = st.selectbox("Failure mode", ["Overtopping", "Piping / internal erosion", "Unknown"])
+
+if supabase:
+    render_user_menu(supabase)
 
 scenario = SCENARIOS[scenario_name]
 

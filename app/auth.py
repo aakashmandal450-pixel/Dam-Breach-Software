@@ -91,9 +91,8 @@ def render_auth_gate() -> Client | None:
     supabase = create_supabase_client()
 
     if supabase is None:
-        st.error("Supabase is not configured.")
-        st.write("Add your project URL and publishable key to `.streamlit/secrets.toml`.")
-        st.stop()
+        st.sidebar.warning("Supabase not configured. Auth disabled.")
+        return None
 
     if restore_session(supabase):
         return supabase
