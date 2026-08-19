@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import streamlit as st
+import streamlit.components.v1 as components
 from supabase import Client, create_client
 
 
@@ -87,6 +88,81 @@ def restore_session(supabase: Client) -> bool:
     return _store_session(response)
 
 
+# ---------------------------------------------------------------------------
+# GitHub OAuth support
+# ---------------------------------------------------------------------------
+# Supabase returns OAuth tokens in the URL *fragment* (#access_token=...),
+# which Streamlit's Python backend cannot read directly (fragments never
+# reach the server). The small JS snippet below runs in the browser, moves
+# the fragment into a query parameter, and reloads once so Streamlit can
+# pick the tokens up via st.query_params.
+
+
+def _get_redirect_url() -> str | None:
+    return _get_secret("redirect_url")  # e.g. "https://your-app.streamlit.app"
+
+
+def _capture_oauth_fragment() -> None:
+    components.html(
+        """
+        <script>
+        const hash = window.parent.location.hash;
+        if (hash && hash.includes('access_token')) {
+            const params = new URLSearchParams(hash.substring(1));
+            const url = new URL(window.parent.location.href);
+            url.hash = '';
+            url.searchParams.set('access_token', params.get('access_token'));
+            url.searchParams.set('refresh_token', params.get('refresh_token'));
+            window.parent.location.replace(url.toString());
+        }
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _consume_oauth_query_tokens(supabase: Client) -> bool:
+    access_token = st.query_params.get("access_token")
+    refresh_token = st.query_params.get("refresh_token")
+
+    if not access_token or not refresh_token:
+        return False
+
+    try:
+        response = supabase.auth.set_session(access_token, refresh_token)
+    except Exception as exc:
+        st.error(f"GitHub sign-in failed: {exc}")
+        return False
+
+    stored = _store_session(response)
+    if stored:
+        st.query_params.clear()
+    return stored
+
+
+def render_github_sign_in(supabase: Client) -> None:
+    redirect_url = _get_redirect_url()
+    try:
+        response = supabase.auth.sign_in_with_oauth(
+            {
+                "provider": "github",
+                "options": {"redirect_to": redirect_url} if redirect_url else {},
+            }
+        )
+    except Exception as exc:
+        st.error(f"Could not start GitHub sign-in: {exc}")
+        return
+
+    oauth_url = _read_field(response, "url")
+    if oauth_url:
+        st.link_button("Continue with GitHub", oauth_url, width="stretch")
+
+
+# ---------------------------------------------------------------------------
+# Auth gate / UI
+# ---------------------------------------------------------------------------
+
+
 def render_auth_gate() -> Client | None:
     supabase = create_supabase_client()
 
@@ -94,11 +170,19 @@ def render_auth_gate() -> Client | None:
         st.sidebar.warning("Supabase not configured. Auth disabled.")
         return None
 
+    _capture_oauth_fragment()
+
+    if _consume_oauth_query_tokens(supabase):
+        st.rerun()
+
     if restore_session(supabase):
         return supabase
 
     st.title("Dam Breach Studio")
     st.caption("Sign in to access the protected analysis workspace.")
+
+    render_github_sign_in(supabase)
+    st.divider()
 
     sign_in_tab, sign_up_tab = st.tabs(["Sign in", "Create account"])
 
