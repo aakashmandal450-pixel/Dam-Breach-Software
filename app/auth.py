@@ -1,10 +1,17 @@
 import os
+import secrets as _secrets
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import streamlit as st
-import streamlit.components.v1 as components
-from supabase import Client, create_client
+from supabase.client import Client, ClientOptions, create_client
+
+try:
+    from supabase_auth import SyncSupportedStorage
+except ImportError:
+    from gotrue import SyncSupportedStorage
 
 
 @dataclass(frozen=True)
@@ -36,12 +43,74 @@ def get_supabase_config() -> SupabaseConfig | None:
     return SupabaseConfig(url=url, publishable_key=publishable_key)
 
 
-def create_supabase_client() -> Client | None:
-    config = get_supabase_config()
-    if config is None:
+# ---------------------------------------------------------------------------
+# PKCE code_verifier storage
+# ---------------------------------------------------------------------------
+# CONFIRMED BY DEBUG TRACE: st.session_state does NOT survive the full-page
+# round trip to GitHub's site and back, even in the same browser tab.
+# Streamlit assigns a fresh session identity on that return navigation, so
+# anything stored in session_state before leaving is gone by the time
+# ?code=... comes back.
+#
+# Fix: store the PKCE code_verifier in a process-wide dict (plain Python
+# memory shared by the whole running Streamlit server), keyed by a random
+# one-time "flow_id" that we generate ourselves and carry through the
+# redirect_to URL as a query parameter. Since we -- not Streamlit -- are
+# responsible for round-tripping that key, it survives regardless of how
+# Streamlit's session identity behaves across the navigation.
+#
+# This is safe for concurrent users: each sign-in attempt gets its own
+# random flow_id, so there's no cross-user collision. Entries are removed
+# after a successful (or failed) exchange so the dict doesn't grow forever.
+
+_PKCE_LOCK = Lock()
+_PKCE_VERIFIERS: dict[str, str] = {}
+_VERIFIER_KEY_SUFFIX = "-code-verifier"
+
+
+class ProcessPKCEStorage(SyncSupportedStorage):
+    """Supabase auth storage backend that persists the PKCE code_verifier
+    in process memory, keyed by an externally-supplied flow_id, instead of
+    relying on Streamlit's per-session state."""
+
+    def __init__(self) -> None:
+        self._flow_id: str | None = None
+
+    def set_flow_id(self, flow_id: str | None) -> None:
+        self._flow_id = flow_id
+
+    def get_item(self, key: str) -> str | None:
+        if key.endswith(_VERIFIER_KEY_SUFFIX) and self._flow_id:
+            with _PKCE_LOCK:
+                return _PKCE_VERIFIERS.get(self._flow_id)
         return None
 
-    return create_client(config.url, config.publishable_key)
+    def set_item(self, key: str, value: str) -> None:
+        if key.endswith(_VERIFIER_KEY_SUFFIX) and self._flow_id:
+            with _PKCE_LOCK:
+                _PKCE_VERIFIERS[self._flow_id] = value
+
+    def remove_item(self, key: str) -> None:
+        if key.endswith(_VERIFIER_KEY_SUFFIX) and self._flow_id:
+            with _PKCE_LOCK:
+                _PKCE_VERIFIERS.pop(self._flow_id, None)
+
+
+def create_supabase_client() -> tuple[Client, ProcessPKCEStorage] | tuple[None, None]:
+    config = get_supabase_config()
+    if config is None:
+        return None, None
+
+    storage = ProcessPKCEStorage()
+    client = create_client(
+        config.url,
+        config.publishable_key,
+        options=ClientOptions(
+            storage=storage,
+            flow_type="pkce",
+        ),
+    )
+    return client, storage
 
 
 def _read_field(value: Any, field: str) -> Any:
@@ -91,48 +160,41 @@ def restore_session(supabase: Client) -> bool:
 # ---------------------------------------------------------------------------
 # GitHub OAuth support
 # ---------------------------------------------------------------------------
-# Supabase returns OAuth tokens in the URL *fragment* (#access_token=...),
-# which Streamlit's Python backend cannot read directly (fragments never
-# reach the server). The small JS snippet below runs in the browser, moves
-# the fragment into a query parameter, and reloads once so Streamlit can
-# pick the tokens up via st.query_params.
+# Supabase (with flow_type="pkce") redirects back with an authorization
+# code in a query param: http://localhost:8501/?code=...&flow_id=...
+# We read both, point the storage at the right flow_id so it can find the
+# matching code_verifier, then exchange the code for a session.
 
 
 def _get_redirect_url() -> str | None:
     return _get_secret("redirect_url")  # e.g. "https://your-app.streamlit.app"
 
 
-def _capture_oauth_fragment() -> None:
-    components.html(
-        """
-        <script>
-        const hash = window.parent.location.hash;
-        if (hash && hash.includes('access_token')) {
-            const params = new URLSearchParams(hash.substring(1));
-            const url = new URL(window.parent.location.href);
-            url.hash = '';
-            url.searchParams.set('access_token', params.get('access_token'));
-            url.searchParams.set('refresh_token', params.get('refresh_token'));
-            window.parent.location.replace(url.toString());
-        }
-        </script>
-        """,
-        height=0,
-    )
+def _append_query_param(url: str, key: str, value: str) -> str:
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query))
+    query[key] = value
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
-def _consume_oauth_query_tokens(supabase: Client) -> bool:
-    access_token = st.query_params.get("access_token")
-    refresh_token = st.query_params.get("refresh_token")
+def _consume_oauth_code(supabase: Client, storage: ProcessPKCEStorage) -> bool:
+    code = st.query_params.get("code")
+    flow_id = st.query_params.get("flow_id")
 
-    if not access_token or not refresh_token:
+    if not code:
         return False
+
+    storage.set_flow_id(flow_id)
 
     try:
-        response = supabase.auth.set_session(access_token, refresh_token)
+        response = supabase.auth.exchange_code_for_session({"auth_code": code})
     except Exception as exc:
         st.error(f"GitHub sign-in failed: {exc}")
+        storage.remove_item("supabase.auth.token" + _VERIFIER_KEY_SUFFIX)
+        st.query_params.clear()
         return False
+
+    storage.remove_item("supabase.auth.token" + _VERIFIER_KEY_SUFFIX)
 
     stored = _store_session(response)
     if stored:
@@ -140,13 +202,21 @@ def _consume_oauth_query_tokens(supabase: Client) -> bool:
     return stored
 
 
-def render_github_sign_in(supabase: Client) -> None:
+def render_github_sign_in(supabase: Client, storage: ProcessPKCEStorage) -> None:
     redirect_url = _get_redirect_url()
+    if not redirect_url:
+        st.error("redirect_url is not configured in secrets. Cannot start GitHub sign-in.")
+        return
+
+    flow_id = _secrets.token_urlsafe(16)
+    storage.set_flow_id(flow_id)
+    redirect_to = _append_query_param(redirect_url, "flow_id", flow_id)
+
     try:
         response = supabase.auth.sign_in_with_oauth(
             {
                 "provider": "github",
-                "options": {"redirect_to": redirect_url} if redirect_url else {},
+                "options": {"redirect_to": redirect_to},
             }
         )
     except Exception as exc:
@@ -155,7 +225,23 @@ def render_github_sign_in(supabase: Client) -> None:
 
     oauth_url = _read_field(response, "url")
     if oauth_url:
-        st.link_button("Continue with GitHub", oauth_url, width="stretch")
+        # target="_self" keeps the whole OAuth round trip in the same tab
+        # (st.link_button opens a new tab, which we don't want here).
+        st.markdown(
+            f"""
+            <a href="{oauth_url}" target="_self" style="text-decoration:none;">
+                <div style="
+                    display:flex; align-items:center; justify-content:center;
+                    padding:0.5rem 1rem; border-radius:0.5rem;
+                    border:1px solid rgba(250,250,250,0.2);
+                    background-color:#262730; color:#fafafa;
+                    font-weight:600; width:100%; cursor:pointer;">
+                    Continue with GitHub
+                </div>
+            </a>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -164,15 +250,13 @@ def render_github_sign_in(supabase: Client) -> None:
 
 
 def render_auth_gate() -> Client | None:
-    supabase = create_supabase_client()
+    supabase, storage = create_supabase_client()
 
     if supabase is None:
         st.sidebar.warning("Supabase not configured. Auth disabled.")
         return None
 
-    _capture_oauth_fragment()
-
-    if _consume_oauth_query_tokens(supabase):
+    if _consume_oauth_code(supabase, storage):
         st.rerun()
 
     if restore_session(supabase):
@@ -181,7 +265,7 @@ def render_auth_gate() -> Client | None:
     st.title("Dam Breach Studio")
     st.caption("Sign in to access the protected analysis workspace.")
 
-    render_github_sign_in(supabase)
+    render_github_sign_in(supabase, storage)
     st.divider()
 
     sign_in_tab, sign_up_tab = st.tabs(["Sign in", "Create account"])
